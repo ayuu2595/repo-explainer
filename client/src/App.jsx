@@ -1,26 +1,43 @@
 import { useState, useEffect } from "react";
 import "./App.css";
 
+const API_URL = "http://localhost:4000";
+
 function App() {
-  const [state, setState] = useState("config"); // config | processing | ready
-  const [apiStatus, setApiStatus] = useState("checking...");
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("http://localhost:4000/api/health")
-      .then((r) => r.json())
-      .then((data) => setApiStatus(data.ok ? "connected ✅" : "error ❌"))
-      .catch(() => setApiStatus("unreachable ❌"));
+    fetch(`${API_URL}/api/auth/me`, { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => setUser(data?.user || null))
+      .finally(() => setLoading(false));
   }, []);
+
+  const handleLogin = () => {
+    window.location.href = `${API_URL}/api/auth/github`;
+  };
+
+  const handleLogout = async () => {
+    await fetch(`${API_URL}/api/auth/logout`, {
+      method: "POST",
+      credentials: "include",
+    });
+    setUser(null);
+  };
+
+  if (loading) return <p>Loading...</p>;
 
   return (
     <div style={{ padding: "2rem", fontFamily: "sans-serif" }}>
       <h1>Repo Explainer</h1>
-      <p>Backend status: {apiStatus}</p>
-      <p>Current state: {state}</p>
-      {state === "config" && (
-        <button onClick={() => setState("processing")}>
-          Fake: go to processing
-        </button>
+      {user ? (
+        <div>
+          <p>Logged in as {user.username}</p>
+          <button onClick={handleLogout}>Logout</button>
+        </div>
+      ) : (
+        <button onClick={handleLogin}>Login with GitHub</button>
       )}
     </div>
   );
