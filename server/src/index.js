@@ -5,6 +5,7 @@ import cookieParser from "cookie-parser";
 import passport from "./config/passport.js";
 import { pool } from "./config/db.js";
 import authRoutes from "./routes/auth.js";
+import repoRoutes from "./routes/repos.js";
 import { requireAuth } from "./middleware/auth.js";
 
 dotenv.config();
@@ -26,6 +27,7 @@ app.get("/api/health", async (req, res) => {
 });
 
 app.use("/api/auth", authRoutes);
+app.use("/api/repos", repoRoutes);
 
 app.get("/api/protected-test", requireAuth, (req, res) => {
   res.json({ ok: true, userId: req.userId });
