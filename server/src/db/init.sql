@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS repos (
   progress INT DEFAULT 0,
   step TEXT,
   error TEXT,
+  last_commit_sha TEXT,
   created_at TIMESTAMPTZ DEFAULT now(),
   UNIQUE(user_id, namespace)
 );
@@ -27,8 +28,11 @@ CREATE TABLE IF NOT EXISTS chunks (
   source_path TEXT,
   content TEXT,
   embedding vector(1536),
+  content_tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE INDEX IF NOT EXISTS chunks_content_tsv_idx ON chunks USING GIN (content_tsv);
 
 CREATE TABLE IF NOT EXISTS messages (
   id SERIAL PRIMARY KEY,

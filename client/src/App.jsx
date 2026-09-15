@@ -146,6 +146,56 @@ function App() {
     }
   };
 
+  const handleResync = async () => {
+    if (ingestState !== null || !activeRepoId) return;
+
+    setError(null);
+
+    try {
+      const res = await fetch(API_URL + "/api/repos/" + activeRepoId + "/resync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      if (data.upToDate) {
+        setError("Already up to date");
+        return;
+      }
+
+      if (data.skipped) return;
+
+      setIngestState({ status: "ingesting", progress: 0, step: "Checking for changes" });
+
+      const es = new EventSource(API_URL + "/api/repos/" + activeRepoId + "/progress", {
+        withCredentials: true,
+      });
+      eventSourceRef.current = es;
+
+      es.onmessage = async (event) => {
+        const update = JSON.parse(event.data);
+        setIngestState(update);
+
+        if (update.status === "ready") {
+          es.close();
+          await fetchSummary(activeRepoId);
+          setIngestState(null);
+        }
+
+        if (update.status === "failed") {
+          es.close();
+          setError(update.error || "Resync failed");
+          setIngestState(null);
+        }
+      };
+    } catch (err) {
+      setError(err.message);
+      setIngestState(null);
+    }
+  };
+
   const handleSendMessage = async () => {
     if (!chatInput.trim() || !activeRepoId || chatLoading) return;
 
@@ -251,6 +301,11 @@ function App() {
           <p><strong>Tech Stack:</strong> {summary.techStack.join(", ")}</p>
           <p><strong>Patterns:</strong> {summary.patterns.join(", ")}</p>
           <p>{summary.stats.files} files, {summary.stats.lines} lines, {summary.stats.languages} languages</p>
+          {activeRepoId ? (
+            <button onClick={handleResync} disabled={ingestState !== null} style={{ marginTop: "0.5rem" }}>
+              Check for Updates
+            </button>
+          ) : null}
         </div>
       ) : null}
 

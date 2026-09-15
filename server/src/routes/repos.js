@@ -2,9 +2,17 @@ import express from "express";
 import { pool } from "../config/db.js";
 import { requireAuth } from "../middleware/auth.js";
 import { decrypt } from "../utils/crypto.js";
-import { parseGitHubRepo, verifyRepoAccess, getEligibleFiles, fetchFileContent } from "../utils/github.js";
+import {
+  parseGitHubRepo,
+  verifyRepoAccess,
+  getEligibleFiles,
+  fetchFileContent,
+  getLatestCommitSha,
+  getChangedFiles,
+} from "../utils/github.js";
 import { chunkFile } from "../utils/chunk.js";
 import { embedTexts, embedText, toVectorLiteral, generateChatCompletion } from "../utils/embeddings.js";
+import { reciprocalRankFusion } from "../utils/search.js";
 
 const router = express.Router();
 
@@ -77,12 +85,87 @@ async function runIngestion(repoId, owner, repo, defaultBranch, token) {
       );
     }
 
+    const latestSha = await getLatestCommitSha(owner, repo, defaultBranch, token);
+
     await pool.query(
-      "UPDATE repos SET status = 'ready', progress = 100, step = 'Complete', error = NULL WHERE id = $1",
-      [repoId]
+      "UPDATE repos SET status = 'ready', progress = 100, step = 'Complete', error = NULL, last_commit_sha = $1 WHERE id = $2",
+      [latestSha, repoId]
     );
   } catch (err) {
     console.error("Ingestion failed:", err.message);
+    await pool.query(
+      "UPDATE repos SET status = 'failed', error = $1 WHERE id = $2",
+      [err.message || "Unknown error", repoId]
+    );
+  }
+}
+
+async function runResync(repoId, owner, repo, defaultBranch, token, baseSha, latestSha) {
+  try {
+    await updateProgress(repoId, 10, "Comparing commits");
+
+    const changedFiles = await getChangedFiles(owner, repo, baseSha, latestSha, token);
+
+    if (changedFiles.length === 0) {
+      await pool.query(
+        "UPDATE repos SET status = 'ready', progress = 100, step = 'Complete', last_commit_sha = $1 WHERE id = $2",
+        [latestSha, repoId]
+      );
+      return;
+    }
+
+    await updateProgress(repoId, 20, `${changedFiles.length} files changed`);
+
+    for (const file of changedFiles) {
+      await pool.query("DELETE FROM chunks WHERE repo_id = $1 AND source_path = $2", [repoId, file.path]);
+    }
+
+    const filesToReembed = changedFiles.filter((f) => f.status !== "removed");
+    const allChunks = [];
+
+    for (let i = 0; i < filesToReembed.length; i++) {
+      const file = filesToReembed[i];
+      const content = await fetchFileContent(owner, repo, file.path, defaultBranch, token);
+      if (content) {
+        const chunks = await chunkFile(file.path, content);
+        chunks.forEach((chunkText) => {
+          allChunks.push({ path: file.path, text: chunkText });
+        });
+      }
+
+      const fileProgress = 20 + Math.round(((i + 1) / Math.max(filesToReembed.length, 1)) * 50);
+      await updateProgress(repoId, fileProgress, `Reprocessing files (${i + 1}/${filesToReembed.length})`);
+    }
+
+    if (allChunks.length > 0) {
+      await updateProgress(repoId, 75, `Re-chunked into ${allChunks.length} segments`);
+
+      const BATCH_SIZE = 20;
+      const embeddings = [];
+      const texts = allChunks.map((c) => c.text);
+
+      for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+        const batchEmbeddings = await embedTexts(texts.slice(i, i + BATCH_SIZE));
+        embeddings.push(...batchEmbeddings);
+
+        const embedProgress = 75 + Math.round(((i + BATCH_SIZE) / texts.length) * 20);
+        await updateProgress(repoId, Math.min(embedProgress, 95), `Generating embeddings (${Math.min(i + BATCH_SIZE, texts.length)}/${texts.length})`);
+      }
+
+      for (let i = 0; i < allChunks.length; i++) {
+        await pool.query(
+          "INSERT INTO chunks (repo_id, source_path, content, embedding) VALUES ($1, $2, $3, $4::vector)",
+          [repoId, allChunks[i].path, allChunks[i].text, toVectorLiteral(embeddings[i])]
+        );
+      }
+    }
+
+    await pool.query(
+      "UPDATE repos SET status = 'ready', progress = 100, step = 'Complete', error = NULL, last_commit_sha = $1 WHERE id = $2",
+      [latestSha, repoId]
+    );
+  } catch (err) {
+    console.error("Resync failed:", err.message);
     await pool.query(
       "UPDATE repos SET status = 'failed', error = $1 WHERE id = $2",
       [err.message || "Unknown error", repoId]
@@ -205,6 +288,49 @@ router.post("/ingest", requireAuth, async (req, res) => {
     res.json({ success: true, message: "Ingestion started", repoId, skipped: false });
   } catch (err) {
     res.status(500).json({ error: err.message || "Failed to start ingestion" });
+  }
+});
+
+router.post("/:id/resync", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const repoCheck = await pool.query(
+      "SELECT * FROM repos WHERE id = $1::int AND user_id = $2",
+      [id, req.userId]
+    );
+    if (repoCheck.rows.length === 0) return res.status(404).json({ error: "Repo not found" });
+
+    const repoData = repoCheck.rows[0];
+    if (repoData.status === "ingesting") {
+      return res.json({ success: true, message: "Already syncing", skipped: true, alreadyRunning: true });
+    }
+    if (!repoData.last_commit_sha) {
+      return res.status(400).json({ error: "No baseline commit recorded. Run a full ingest first." });
+    }
+
+    const [owner, repoName] = repoData.namespace.split("/");
+    const token = await getUserToken(req.userId);
+    const { defaultBranch } = await verifyRepoAccess(owner, repoName, token);
+    const latestSha = await getLatestCommitSha(owner, repoName, defaultBranch, token);
+
+    if (latestSha === repoData.last_commit_sha) {
+      return res.json({ success: true, message: "Already up to date", skipped: true, upToDate: true });
+    }
+
+    const claim = await pool.query(
+      "UPDATE repos SET status = 'ingesting', progress = 0, step = 'Checking for changes', error = NULL WHERE id = $1 AND status != 'ingesting' RETURNING id",
+      [id]
+    );
+    if (claim.rows.length === 0) {
+      return res.json({ success: true, message: "Already syncing", skipped: true, alreadyRunning: true });
+    }
+
+    runResync(id, owner, repoName, defaultBranch, token, repoData.last_commit_sha, latestSha);
+
+    res.json({ success: true, message: "Resync started", repoId: id, skipped: false });
+  } catch (err) {
+    res.status(500).json({ error: err.message || "Failed to start resync" });
   }
 });
 
@@ -365,21 +491,33 @@ router.post("/:id/chat", requireAuth, async (req, res) => {
     const queryEmbedding = await embedText(message);
     const vectorLiteral = toVectorLiteral(queryEmbedding);
 
-    const matches = await pool.query(
+    const vectorMatches = await pool.query(
       `SELECT source_path, content, embedding <=> $2::vector AS distance
        FROM chunks
        WHERE repo_id = $1::int
        ORDER BY embedding <=> $2::vector
-       LIMIT 10`,
+       LIMIT 20`,
       [id, vectorLiteral]
     );
+
+    const keywordMatches = await pool.query(
+      `SELECT source_path, content, ts_rank(content_tsv, websearch_to_tsquery('english', $2)) AS rank
+       FROM chunks
+       WHERE repo_id = $1::int AND content_tsv @@ websearch_to_tsquery('english', $2)
+       ORDER BY rank DESC
+       LIMIT 20`,
+      [id, message]
+    );
+
+    const fusedResults = reciprocalRankFusion(vectorMatches.rows, keywordMatches.rows).slice(0, 10);
+
+    const matches = { rows: fusedResults };
 
     const sourceMap = new Map();
     matches.rows.forEach((r) => {
       if (!sourceMap.has(r.source_path)) {
         sourceMap.set(r.source_path, {
           path: r.source_path,
-          relevance: Number((1 - r.distance).toFixed(3)),
           url: `https://github.com/${owner}/${repoName}/blob/${defaultBranch}/${r.source_path}`,
         });
       }

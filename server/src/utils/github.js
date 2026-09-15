@@ -113,3 +113,43 @@ export async function fetchFileContent(owner, repo, path, branch, token) {
     return null;
   }
 }
+
+
+export async function getLatestCommitSha(owner, repo, branch, token) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "repo-explainer",
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/commits/${branch}`,
+    { headers }
+  );
+
+  if (!res.ok) throw new Error(`Failed to fetch latest commit (${res.status})`);
+
+  const data = await res.json();
+  return data.sha;
+}
+
+export async function getChangedFiles(owner, repo, baseSha, headSha, token) {
+  const headers = {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "repo-explainer",
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/compare/${baseSha}...${headSha}`,
+    { headers }
+  );
+
+  if (!res.ok) throw new Error(`Failed to compare commits (${res.status})`);
+
+  const data = await res.json();
+  return (data.files || []).map((f) => ({
+    path: f.filename,
+    status: f.status,
+  }));
+}
