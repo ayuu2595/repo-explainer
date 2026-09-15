@@ -262,9 +262,9 @@ router.post("/:id/summarize", requireAuth, async (req, res) => {
 
     const matches = await pool.query(
       `SELECT source_path, content FROM chunks
-      WHERE repo_id = $1::int
-      ORDER BY embedding <=> $2::vector
-      LIMIT 100`,
+       WHERE repo_id = $1::int
+       ORDER BY embedding <=> $2::vector
+       LIMIT 100`,
       [id, vectorLiteral]
     );
 
@@ -341,6 +341,97 @@ Format: {"summary": "1-paragraph summary", "techStack": ["tech1"], "patterns": [
   }
 });
 
+router.post("/:id/chat", requireAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { message, history } = req.body;
 
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "Message is required" });
+    }
+
+    const repoCheck = await pool.query(
+      "SELECT * FROM repos WHERE id = $1::int AND user_id = $2",
+      [id, req.userId]
+    );
+    if (repoCheck.rows.length === 0) return res.status(404).json({ error: "Repo not found" });
+
+    const repoData = repoCheck.rows[0];
+    const [owner, repoName] = repoData.namespace.split("/");
+
+    const token = await getUserToken(req.userId);
+    const { defaultBranch } = await verifyRepoAccess(owner, repoName, token);
+
+    const queryEmbedding = await embedText(message);
+    const vectorLiteral = toVectorLiteral(queryEmbedding);
+
+    const matches = await pool.query(
+      `SELECT source_path, content, embedding <=> $2::vector AS distance
+       FROM chunks
+       WHERE repo_id = $1::int
+       ORDER BY embedding <=> $2::vector
+       LIMIT 10`,
+      [id, vectorLiteral]
+    );
+
+    const sourceMap = new Map();
+    matches.rows.forEach((r) => {
+      if (!sourceMap.has(r.source_path)) {
+        sourceMap.set(r.source_path, {
+          path: r.source_path,
+          relevance: Number((1 - r.distance).toFixed(3)),
+          url: `https://github.com/${owner}/${repoName}/blob/${defaultBranch}/${r.source_path}`,
+        });
+      }
+    });
+    const uniqueSources = Array.from(sourceMap.values());
+
+    const context = matches.rows
+      .map((r) => `File: ${r.source_path}\n${r.content}`)
+      .join("\n\n---\n\n");
+
+    const historyText = Array.isArray(history)
+      ? history.map((h) => `${h.role}: ${h.content}`).join("\n")
+      : "";
+
+    const systemPrompt = `You are a helpful assistant answering questions about a specific codebase.
+Use only the provided code context to answer. If the context doesn't contain the answer, say so honestly.
+Be concise and technical. Reference specific file names when relevant.`;
+
+    const userPrompt = `Conversation so far:\n${historyText}\n\nCode context:\n${context}\n\nQuestion: ${message}`;
+
+    const answer = await generateChatCompletion(systemPrompt, userPrompt);
+
+    await pool.query(
+      "INSERT INTO messages (repo_id, role, content) VALUES ($1, 'user', $2)",
+      [id, message]
+    );
+    await pool.query(
+      "INSERT INTO messages (repo_id, role, content) VALUES ($1, 'assistant', $2)",
+      [id, answer]
+    );
+
+    res.json({ answer, sources: uniqueSources });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+router.get("/:id/messages", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const repoCheck = await pool.query(
+    "SELECT id FROM repos WHERE id = $1::int AND user_id = $2",
+    [id, req.userId]
+  );
+  if (repoCheck.rows.length === 0) return res.status(404).json({ error: "Repo not found" });
+
+  const result = await pool.query(
+    "SELECT role, content, created_at FROM messages WHERE repo_id = $1::int ORDER BY created_at ASC",
+    [id]
+  );
+
+  res.json({ messages: result.rows });
+});
 
 export default router;
