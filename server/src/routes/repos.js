@@ -17,9 +17,82 @@ async function getUserToken(userId) {
   return decrypt(result.rows[0].access_token);
 }
 
+async function updateProgress(repoId, progress, step) {
+  await pool.query("UPDATE repos SET progress = $1, step = $2 WHERE id = $3", [progress, step, repoId]);
+}
+
+async function runIngestion(repoId, owner, repo, defaultBranch, token) {
+  try {
+    await updateProgress(repoId, 5, "Verifying repository access");
+
+    const files = await getEligibleFiles(owner, repo, defaultBranch, token);
+
+    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
+    if (files.length > MAX_FILES || totalSize > MAX_TOTAL_SIZE_BYTES) {
+      throw new Error("Repository exceeds size limits for ingestion");
+    }
+
+    await updateProgress(repoId, 10, `Found ${files.length} files`);
+
+    const allChunks = [];
+
+    for (let i = 0; i < files.length; i++) {
+      const file = files[i];
+      const content = await fetchFileContent(owner, repo, file.path, defaultBranch, token);
+      if (content) {
+        const chunks = await chunkFile(file.path, content);
+        chunks.forEach((chunkText) => {
+          allChunks.push({ path: file.path, text: chunkText });
+        });
+      }
+
+      const fileProgress = 10 + Math.round(((i + 1) / files.length) * 40);
+      await updateProgress(repoId, fileProgress, `Reading files (${i + 1}/${files.length})`);
+    }
+
+    if (allChunks.length === 0) {
+      throw new Error("No text content could be extracted from this repository.");
+    }
+
+    await updateProgress(repoId, 55, `Chunked into ${allChunks.length} segments`);
+
+    const BATCH_SIZE = 20;
+    const embeddings = [];
+    const texts = allChunks.map((c) => c.text);
+
+    for (let i = 0; i < texts.length; i += BATCH_SIZE) {
+      const batchEmbeddings = await embedTexts(texts.slice(i, i + BATCH_SIZE));
+      embeddings.push(...batchEmbeddings);
+
+      const embedProgress = 55 + Math.round(((i + BATCH_SIZE) / texts.length) * 35);
+      await updateProgress(repoId, Math.min(embedProgress, 90), `Generating embeddings (${Math.min(i + BATCH_SIZE, texts.length)}/${texts.length})`);
+    }
+
+    await updateProgress(repoId, 92, "Storing vectors in database");
+
+    for (let i = 0; i < allChunks.length; i++) {
+      await pool.query(
+        "INSERT INTO chunks (repo_id, source_path, content, embedding) VALUES ($1, $2, $3, $4::vector)",
+        [repoId, allChunks[i].path, allChunks[i].text, toVectorLiteral(embeddings[i])]
+      );
+    }
+
+    await pool.query(
+      "UPDATE repos SET status = 'ready', progress = 100, step = 'Complete', error = NULL WHERE id = $1",
+      [repoId]
+    );
+  } catch (err) {
+    console.error("Ingestion failed:", err.message);
+    await pool.query(
+      "UPDATE repos SET status = 'failed', error = $1 WHERE id = $2",
+      [err.message || "Unknown error", repoId]
+    );
+  }
+}
+
 router.get("/", requireAuth, async (req, res) => {
   const result = await pool.query(
-    "SELECT id, namespace, repo_url, status, progress, created_at FROM repos WHERE user_id = $1 ORDER BY created_at DESC",
+    "SELECT id, namespace, repo_url, status, progress, step, error, created_at FROM repos WHERE user_id = $1 ORDER BY created_at DESC",
     [req.userId]
   );
   res.json({ repos: result.rows });
@@ -72,68 +145,106 @@ router.post("/ingest", requireAuth, async (req, res) => {
       return res.json({ success: true, message: "Already ingested", repoId: existing.rows[0].id, skipped: true });
     }
 
-    const token = await getUserToken(req.userId);
-    const { defaultBranch } = await verifyRepoAccess(parsed.owner, parsed.repo, token);
-    const files = await getEligibleFiles(parsed.owner, parsed.repo, defaultBranch, token);
-
-    const totalSize = files.reduce((sum, f) => sum + f.size, 0);
-    if (files.length > MAX_FILES || totalSize > MAX_TOTAL_SIZE_BYTES) {
-      return res.status(400).json({ error: "Repository exceeds size limits for ingestion" });
-    }
-
-    let repoId;
-    if (existing.rows.length > 0) {
-      repoId = existing.rows[0].id;
-      await pool.query("UPDATE repos SET status = 'ingesting', progress = 0 WHERE id = $1", [repoId]);
-      await pool.query("DELETE FROM chunks WHERE repo_id = $1", [repoId]);
-    } else {
-      const inserted = await pool.query(
-        "INSERT INTO repos (user_id, namespace, repo_url, status) VALUES ($1, $2, $3, 'ingesting') RETURNING id",
-        [req.userId, namespace, repoUrl]
-      );
-      repoId = inserted.rows[0].id;
-    }
-
-    const tStart = performance.now();
-
-    const allChunks = [];
-
-    for (const file of files) {
-      const content = await fetchFileContent(parsed.owner, parsed.repo, file.path, defaultBranch, token);
-      if (!content) continue;
-
-      const chunks = await chunkFile(file.path, content);
-      if (chunks.length === 0) continue;
-
-      chunks.forEach((chunkText) => {
-        allChunks.push({ path: file.path, text: chunkText });
+    if (existing.rows.length > 0 && existing.rows[0].status === "ingesting") {
+      return res.json({
+        success: true,
+        message: "Ingestion already in progress",
+        repoId: existing.rows[0].id,
+        skipped: true,
+        alreadyRunning: true,
       });
     }
 
-    if (allChunks.length === 0) {
-      throw new Error("No text content could be extracted from this repository.");
-    }
+    const token = await getUserToken(req.userId);
+    const { defaultBranch } = await verifyRepoAccess(parsed.owner, parsed.repo, token);
 
-    const embeddings = await embedTexts(allChunks.map((c) => c.text));
-
-    for (let i = 0; i < allChunks.length; i++) {
-      await pool.query(
-        "INSERT INTO chunks (repo_id, source_path, content, embedding) VALUES ($1, $2, $3, $4::vector)",
-        [repoId, allChunks[i].path, allChunks[i].text, toVectorLiteral(embeddings[i])]
+    let repoId;
+    if (existing.rows.length > 0) {
+      const claim = await pool.query(
+        "UPDATE repos SET status = 'ingesting', progress = 0, step = 'Starting', error = NULL WHERE id = $1 AND status != 'ingesting' RETURNING id",
+        [existing.rows[0].id]
       );
+
+      if (claim.rows.length === 0) {
+        return res.json({
+          success: true,
+          message: "Ingestion already in progress",
+          repoId: existing.rows[0].id,
+          skipped: true,
+          alreadyRunning: true,
+        });
+      }
+
+      repoId = claim.rows[0].id;
+      await pool.query("DELETE FROM chunks WHERE repo_id = $1", [repoId]);
+    } else {
+      const inserted = await pool.query(
+        "INSERT INTO repos (user_id, namespace, repo_url, status, step) VALUES ($1, $2, $3, 'ingesting', 'Starting') ON CONFLICT (user_id, namespace) DO NOTHING RETURNING id",
+        [req.userId, namespace, repoUrl]
+      );
+
+      if (inserted.rows.length === 0) {
+        const recheck = await pool.query(
+          "SELECT id, status FROM repos WHERE user_id = $1 AND namespace = $2",
+          [req.userId, namespace]
+        );
+        return res.json({
+          success: true,
+          message: "Ingestion already in progress",
+          repoId: recheck.rows[0]?.id,
+          skipped: true,
+          alreadyRunning: true,
+        });
+      }
+
+      repoId = inserted.rows[0].id;
     }
 
-    const totalMs = Math.round(performance.now() - tStart);
+    runIngestion(repoId, parsed.owner, parsed.repo, defaultBranch, token);
 
-    await pool.query("UPDATE repos SET status = 'ready', progress = 100 WHERE id = $1", [repoId]);
-
-    res.json({ success: true, message: "Ingestion complete", repoId, totalMs, filesProcessed: files.length, chunksCreated: allChunks.length });
+    res.json({ success: true, message: "Ingestion started", repoId, skipped: false });
   } catch (err) {
-    if (err.message) {
-      console.error("Ingestion failed:", err.message);
-    }
-    res.status(500).json({ error: err.message || "Ingestion failed" });
+    res.status(500).json({ error: err.message || "Failed to start ingestion" });
   }
+});
+
+router.get("/:id/progress", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const repoCheck = await pool.query("SELECT id FROM repos WHERE id = $1 AND user_id = $2", [id, req.userId]);
+  if (repoCheck.rows.length === 0) {
+    return res.status(404).end();
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+
+  const interval = setInterval(async () => {
+    const result = await pool.query(
+      "SELECT status, progress, step, error FROM repos WHERE id = $1",
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      clearInterval(interval);
+      res.end();
+      return;
+    }
+
+    const row = result.rows[0];
+    res.write(`data: ${JSON.stringify(row)}\n\n`);
+
+    if (row.status === "ready" || row.status === "failed") {
+      clearInterval(interval);
+      res.end();
+    }
+  }, 1000);
+
+  req.on("close", () => {
+    clearInterval(interval);
+  });
 });
 
 router.post("/:id/summarize", requireAuth, async (req, res) => {
@@ -151,9 +262,9 @@ router.post("/:id/summarize", requireAuth, async (req, res) => {
 
     const matches = await pool.query(
       `SELECT source_path, content FROM chunks
-       WHERE repo_id = $1
-       ORDER BY embedding <=> $2::vector
-       LIMIT 100`,
+      WHERE repo_id = $1::int
+      ORDER BY embedding <=> $2::vector
+      LIMIT 100`,
       [id, vectorLiteral]
     );
 
@@ -229,5 +340,7 @@ Format: {"summary": "1-paragraph summary", "techStack": ["tech1"], "patterns": [
     res.status(500).json({ error: err.message });
   }
 });
+
+
 
 export default router;

@@ -15,6 +15,8 @@ CREATE TABLE IF NOT EXISTS repos (
   repo_url TEXT NOT NULL,
   status TEXT DEFAULT 'pending',
   progress INT DEFAULT 0,
+  step TEXT,
+  error TEXT,
   created_at TIMESTAMPTZ DEFAULT now(),
   UNIQUE(user_id, namespace)
 );

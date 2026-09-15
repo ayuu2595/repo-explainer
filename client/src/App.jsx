@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import "./App.css";
 
 const API_URL = "http://localhost:4000";
@@ -8,15 +8,20 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [repoUrl, setRepoUrl] = useState("");
   const [estimate, setEstimate] = useState(null);
-  const [ingesting, setIngesting] = useState(false);
+  const [ingestState, setIngestState] = useState(null);
   const [summary, setSummary] = useState(null);
   const [error, setError] = useState(null);
+  const eventSourceRef = useRef(null);
 
   useEffect(() => {
     fetch(`${API_URL}/api/auth/me`, { credentials: "include" })
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => setUser(data?.user || null))
       .finally(() => setLoading(false));
+
+    return () => {
+      eventSourceRef.current?.close();
+    };
   }, []);
 
   const handleLogin = () => {
@@ -31,6 +36,7 @@ function App() {
   const handleEstimate = async () => {
     setError(null);
     setSummary(null);
+    setIngestState(null);
     const res = await fetch(`${API_URL}/api/repos/estimate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -45,9 +51,23 @@ function App() {
     setEstimate(data);
   };
 
+  const fetchSummary = async (repoId) => {
+    const summaryRes = await fetch(`${API_URL}/api/repos/${repoId}/summarize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+    });
+    const summaryData = await summaryRes.json();
+    setSummary(summaryData);
+  };
+
   const handleIngest = async () => {
-    setIngesting(true);
+    if (ingestState !== null) return;
+
     setError(null);
+    setEstimate(null);
+    setIngestState({ status: "ingesting", progress: 0, step: "Starting" });
+
     try {
       const res = await fetch(`${API_URL}/api/repos/ingest`, {
         method: "POST",
@@ -58,18 +78,42 @@ function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
 
-      const summaryRes = await fetch(`${API_URL}/api/repos/${data.repoId}/summarize`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
+      if (data.skipped) {
+        setIngestState(null);
+        await fetchSummary(data.repoId);
+        return;
+      }
+
+      const es = new EventSource(`${API_URL}/api/repos/${data.repoId}/progress`, {
+        withCredentials: true,
       });
-      const summaryData = await summaryRes.json();
-      setSummary(summaryData);
-      setEstimate(null);
+      eventSourceRef.current = es;
+
+      es.onmessage = async (event) => {
+        const update = JSON.parse(event.data);
+        setIngestState(update);
+
+        if (update.status === "ready") {
+          es.close();
+          await fetchSummary(data.repoId);
+          setIngestState(null);
+        }
+
+        if (update.status === "failed") {
+          es.close();
+          setError(update.error || "Ingestion failed");
+          setIngestState(null);
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        setError("Lost connection to progress stream");
+        setIngestState(null);
+      };
     } catch (err) {
       setError(err.message);
-    } finally {
-      setIngesting(false);
+      setIngestState(null);
     }
   };
 
@@ -107,10 +151,26 @@ function App() {
               {estimate.tooLarge ? (
                 <p style={{ color: "red" }}>Repository too large to ingest.</p>
               ) : (
-                <button onClick={handleIngest} disabled={ingesting}>
-                  {ingesting ? "Ingesting..." : "Confirm & Ingest"}
-                </button>
+                <button onClick={handleIngest} disabled={ingestState !== null}>Confirm & Ingest</button>
               )}
+            </div>
+          )}
+
+          {ingestState && (
+            <div style={{ marginTop: "1rem" }}>
+              <p>{ingestState.step}</p>
+              <div style={{ background: "#333", height: "8px", width: "300px", borderRadius: "4px" }}>
+                <div
+                  style={{
+                    background: "#4ade80",
+                    height: "8px",
+                    width: `${ingestState.progress}%`,
+                    borderRadius: "4px",
+                    transition: "width 0.3s",
+                  }}
+                />
+              </div>
+              <p>{ingestState.progress}%</p>
             </div>
           )}
 
