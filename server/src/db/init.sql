@@ -41,3 +41,18 @@ CREATE TABLE IF NOT EXISTS messages (
   content TEXT,
   created_at TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS request_logs (
+  id SERIAL PRIMARY KEY,
+  user_id INT REFERENCES users(id) ON DELETE CASCADE,
+  repo_id INT REFERENCES repos(id) ON DELETE CASCADE,
+  endpoint TEXT NOT NULL,
+  duration_ms INT,
+  embedding_tokens INT,
+  chat_input_tokens INT,
+  chat_output_tokens INT,
+  estimated_cost_usd NUMERIC(10,6),
+  status TEXT,
+  error TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);

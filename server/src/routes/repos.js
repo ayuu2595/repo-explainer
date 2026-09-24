@@ -13,6 +13,8 @@ import {
 import { chunkFile } from "../utils/chunk.js";
 import { embedTexts, embedText, toVectorLiteral, generateChatCompletion } from "../utils/embeddings.js";
 import { reciprocalRankFusion } from "../utils/search.js";
+import { chatRateLimiter, ingestRateLimiter, dailyIngestQuota } from "../middleware/rateLimiter.js";
+import { logRequest, estimateTokens } from "../utils/logger.js";
 
 const router = express.Router();
 
@@ -30,6 +32,7 @@ async function updateProgress(repoId, progress, step) {
 }
 
 async function runIngestion(repoId, owner, repo, defaultBranch, token) {
+  const tStart = performance.now();
   try {
     await updateProgress(repoId, 5, "Verifying repository access");
 
@@ -91,12 +94,35 @@ async function runIngestion(repoId, owner, repo, defaultBranch, token) {
       "UPDATE repos SET status = 'ready', progress = 100, step = 'Complete', error = NULL, last_commit_sha = $1 WHERE id = $2",
       [latestSha, repoId]
     );
+
+    const totalDurationMs = Math.round(performance.now() - tStart);
+    const totalEmbeddingTokens = allChunks.reduce((sum, c) => sum + estimateTokens(c.text), 0);
+
+    const repoOwnerResult = await pool.query("SELECT user_id FROM repos WHERE id = $1", [repoId]);
+    await logRequest({
+      userId: repoOwnerResult.rows[0]?.user_id,
+      repoId,
+      endpoint: "ingest",
+      durationMs: totalDurationMs,
+      embeddingTokens: totalEmbeddingTokens,
+      status: "success",
+    });
   } catch (err) {
     console.error("Ingestion failed:", err.message);
     await pool.query(
       "UPDATE repos SET status = 'failed', error = $1 WHERE id = $2",
       [err.message || "Unknown error", repoId]
     );
+
+    const repoOwnerResult = await pool.query("SELECT user_id FROM repos WHERE id = $1", [repoId]);
+    await logRequest({
+      userId: repoOwnerResult.rows[0]?.user_id,
+      repoId,
+      endpoint: "ingest",
+      durationMs: Math.round(performance.now() - tStart),
+      status: "failed",
+      error: err.message,
+    });
   }
 }
 
@@ -211,7 +237,7 @@ router.post("/estimate", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/ingest", requireAuth, async (req, res) => {
+router.post("/ingest", requireAuth, ingestRateLimiter, dailyIngestQuota, async (req, res) => {
   const { repoUrl } = req.body;
   const parsed = parseGitHubRepo(repoUrl);
   if (!parsed) return res.status(400).json({ error: "Invalid GitHub URL" });
@@ -291,7 +317,7 @@ router.post("/ingest", requireAuth, async (req, res) => {
   }
 });
 
-router.post("/:id/resync", requireAuth, async (req, res) => {
+router.post("/:id/resync", requireAuth, ingestRateLimiter, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -467,9 +493,12 @@ Format: {"summary": "1-paragraph summary", "techStack": ["tech1"], "patterns": [
   }
 });
 
-router.post("/:id/chat", requireAuth, async (req, res) => {
+router.post("/:id/chat", requireAuth, chatRateLimiter, async (req, res) => {
+  const tStart = performance.now();
+  const { id } = req.params;
+  let context = "";
+
   try {
-    const { id } = req.params;
     const { message, history } = req.body;
 
     if (!message || typeof message !== "string") {
@@ -524,7 +553,7 @@ router.post("/:id/chat", requireAuth, async (req, res) => {
     });
     const uniqueSources = Array.from(sourceMap.values());
 
-    const context = matches.rows
+    context = matches.rows
       .map((r) => `File: ${r.source_path}\n${r.content}`)
       .join("\n\n---\n\n");
 
@@ -549,8 +578,29 @@ Be concise and technical. Reference specific file names when relevant.`;
       [id, answer]
     );
 
+    const durationMs = Math.round(performance.now() - tStart);
+    await logRequest({
+      userId: req.userId,
+      repoId: id,
+      endpoint: "chat",
+      durationMs,
+      embeddingTokens: estimateTokens(message),
+      chatInputTokens: estimateTokens(context) + estimateTokens(message),
+      chatOutputTokens: estimateTokens(answer),
+      status: "success",
+    });
+
     res.json({ answer, sources: uniqueSources });
   } catch (err) {
+    const durationMs = Math.round(performance.now() - tStart);
+    await logRequest({
+      userId: req.userId,
+      repoId: id,
+      endpoint: "chat",
+      durationMs,
+      status: "failed",
+      error: err.message,
+    });
     res.status(500).json({ error: err.message });
   }
 });
@@ -570,6 +620,22 @@ router.get("/:id/messages", requireAuth, async (req, res) => {
   );
 
   res.json({ messages: result.rows });
+});
+
+router.get("/stats/overview", requireAuth, async (req, res) => {
+  const result = await pool.query(
+    `SELECT endpoint,
+            COUNT(*) AS request_count,
+            AVG(duration_ms)::int AS avg_duration_ms,
+            SUM(estimated_cost_usd) AS total_cost_usd,
+            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failure_count
+     FROM request_logs
+     WHERE user_id = $1
+     GROUP BY endpoint`,
+    [req.userId]
+  );
+
+  res.json({ stats: result.rows });
 });
 
 export default router;
