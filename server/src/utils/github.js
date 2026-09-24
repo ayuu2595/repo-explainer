@@ -1,6 +1,7 @@
 export function parseGitHubRepo(repoUrl) {
   try {
-    const { pathname } = new URL(repoUrl);
+    const { hostname, pathname } = new URL(repoUrl);
+    if (hostname !== "github.com" && hostname !== "www.github.com") return null;
     const parts = pathname.split("/").filter(Boolean);
     if (parts.length < 2) return null;
     return { owner: parts[0], repo: parts[1].replace(/\.git$/, "") };
